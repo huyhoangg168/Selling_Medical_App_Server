@@ -15,6 +15,7 @@ const RedeemedCoupon = require('./RedeemedCoupon');
 const Notificate = require('./Notificate');
 const OTP = require('./RegisterOTP');
 const FirebaseDeviceToken = require('./FirebaseDeviceToken');
+const Category = require('./Category');
 
 // Product Associations
 Product.belongsTo(Unit, {
@@ -24,6 +25,16 @@ Product.belongsTo(Unit, {
 
 Product.hasOne(Cart, {
     foreignKey: 'id_product',
+});
+
+Product.belongsTo(Category, {
+    foreignKey: 'id_category',
+    as: 'category',
+});
+
+Category.hasMany(Product, {
+    foreignKey: 'id_category',
+    as: 'products',
 });
 
 // Unit Associations
@@ -137,4 +148,5 @@ module.exports = {
     Notificate,
     OTP,
     FirebaseDeviceToken,
+    Category,
 };

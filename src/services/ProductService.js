@@ -128,3 +128,25 @@ exports.getProductByFilter = asyncErrorWrapper(async (keySearch, categoryId, min
 
     return products;
 });
+
+// [POST] /api/product  – ADMIN thêm sản phẩm
+exports.createProduct = asyncErrorWrapper(async (productData) => {
+    const product = await Product.create(productData);
+    return product;
+});
+
+// [PATCH] /api/product/:id – ADMIN sửa thông tin / số lượng
+exports.updateProduct = asyncErrorWrapper(async (productId, productData) => {
+    await Product.update(productData, {
+        where: { id: productId }
+    });
+});
+
+// [DELETE] /api/product/:id – ADMIN xóa sản phẩm
+// Gợi ý: xóa mềm bằng status = 0 để không vỡ cart/order
+exports.deleteProduct = asyncErrorWrapper(async (productId) => {
+    await Product.update(
+        { status: 0 },      // ẩn sản phẩm
+        { where: { id: productId } }
+    );
+});

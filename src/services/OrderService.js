@@ -31,6 +31,59 @@ exports.getAllOrdersByUserId = asyncErrorWrapper(async (userId) => {
     return orders;
 });
 
+exports.getAllOrdersForAdmin = asyncErrorWrapper(async (status) => {
+    const whereClause = {};
+
+    // Nếu muốn chỉ lấy đơn "chờ duyệt" thì dùng status = 2
+    if (status !== undefined) {
+        whereClause.status = status;
+    }
+
+    const orders = await Order.findAll({
+        where: whereClause,
+        include: [
+            {
+                model: User,
+                as: 'user',
+                attributes: ['phone', 'email', 'username']
+            },
+            {
+                model: RedeemedCoupon,
+                as: 'redeemed_coupons',
+                attributes: ['code']
+            }
+        ],
+        attributes: { exclude: ['id_user', 'id_redeemed_coupon'] },
+        order: [['orderTime', 'DESC']]
+    });
+
+    return orders;
+});
+
+// Thống kê đơn hàng cho admin
+// status: 1 = thành công, 0 = hủy, 2 = đang chờ
+exports.getAdminOrderStatistics = asyncErrorWrapper(async () => {
+    // Tổng số đơn
+    const totalOrders = await Order.count();
+
+    // Số đơn theo trạng thái
+    const successCount = await Order.count({ where: { status: 1 } });
+    const failedCount  = await Order.count({ where: { status: 0 } });
+    const pendingCount = await Order.count({ where: { status: 2 } });
+
+    // Tổng tiền (thường chỉ tính đơn thành công)
+    const totalRevenue = (await Order.sum('total', { where: { status: 1 } })) || 0;
+
+    return {
+        totalOrders,
+        totalRevenue,
+        successCount,
+        failedCount,
+        pendingCount
+    };
+});
+
+
 async function getOrderByCode(code) {
     const order = await Order.findOne({
         where: { code: code },
@@ -55,7 +108,7 @@ exports.getOrderByCode = asyncErrorWrapper(getOrderByCode);
 exports.createOrderWithCOD = asyncErrorWrapper(async (listCartItem, order) => {
 
     order.code = generateOrderCode();
-    order.status = 1; //success
+    order.status = 2; //pending
     const newOrder = await Order.create(order);
 
     if (newOrder) {

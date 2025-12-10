@@ -4,6 +4,21 @@ const router = express.Router();
 const orderController = require('../controllers/OrderController');
 const authController = require('../controllers/AuthController');
 
+// Thống kê đơn hàng cho admin
+router.route('/admin/statistics')
+    .get(
+        authController.protect,
+        authController.restrict('admin'),
+        orderController.getAdminOrderStatistics
+    );
+
+// Route admin -> ĐẶT TRƯỚC '/:code'
+router.route('/admin')
+    .get(
+        authController.protect,
+        authController.restrict('admin'),
+        orderController.getAllOrdersForAdmin
+    );
 
 router.route('/')
     .get(authController.protect, orderController.getAllOrdersByUserId)
@@ -40,5 +55,13 @@ router.route('/zalopay/callback')
 
 router.route('/zalopay/:app_trans_id')
     .get(authController.protect, orderController.checkZaloPayOrderStatus)
+
+// Admin cập nhật trạng thái đơn hàng
+router.route('/:code/status')
+    .patch(
+        authController.protect,         // bắt buộc đăng nhập
+        authController.restrict('admin'), // chỉ admin mới được đổi trạng thái
+        orderController.updateOrderStatus
+    );
 
 module.exports = router;

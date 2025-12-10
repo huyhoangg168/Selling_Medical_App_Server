@@ -63,4 +63,27 @@ exports.getProductByFilter = asyncErrorHandler(async (req, res, next) => {
     res.status(200).json(products);
 });
 
+// [POST] /api/product  (ADMIN)
+exports.createProduct = asyncErrorHandler(async (req, res, next) => {
+    const productData = req.body;
+    const newProduct = await ProductService.createProduct(productData);
+    res.status(201).json(newProduct);
+});
+
+// [PATCH] /api/product/:id  (ADMIN)
+exports.updateProduct = asyncErrorHandler(async (req, res, next) => {
+    const productId = req.params.id;
+    const productData = req.body;
+
+    await ProductService.updateProduct(productId, productData);
+    res.status(204).end();
+});
+
+// [DELETE] /api/product/:id  (ADMIN)
+exports.deleteProduct = asyncErrorHandler(async (req, res, next) => {
+    const productId = req.params.id;
+
+    await ProductService.deleteProduct(productId);
+    res.status(204).end();
+});
 

@@ -11,6 +11,12 @@ exports.getAllOrdersByUserId = asyncErrorHandler(async (req, res, next) => {
     res.status(200).json(orders);
 });
 
+exports.getAllOrdersForAdmin = asyncErrorHandler(async (req, res, next) => {
+    // chỉ lấy đơn chờ duyệt
+    const orders = await orderService.getAllOrdersForAdmin(2);
+    res.status(200).json(orders);
+});
+
 exports.getOrderByCode = asyncErrorHandler(async (req, res, next) => {
     const code = req.params.code;
     const order = await orderService.getOrderByCode(code);
@@ -109,5 +115,29 @@ exports.checkMoMoPayOrderStatus = asyncErrorHandler(async (req, res, next) => {
     const {partnerCode, requestId, orderId} = req.query;
     const result = await orderService.monitorMoMoOrderStatus(userId, partnerCode, requestId, orderId);
     return res.status(200).json({orderStatus: result});
+});
+
+exports.updateOrderStatus = asyncErrorHandler(async (req, res, next) => {
+    const code = req.params.code;      // Mã đơn hàng
+    const { status } = req.body;       // 1: thành công, 0: hủy, 2: đang chờ
+
+    // Gọi service để cập nhật
+    await orderService.handleUpdateOrderStatus(code, status);
+
+    return res.status(200).json({
+        message: 'Cập nhật trạng thái đơn hàng thành công',
+        code: code,
+        status: status
+    });
+});
+
+// [ADMIN] Lấy thống kê đơn hàng
+exports.getAdminOrderStatistics = asyncErrorHandler(async (req, res, next) => {
+    const stats = await orderService.getAdminOrderStatistics();
+
+    return res.status(200).json({
+        status: 'success',
+        data: stats
+    });
 });
 
