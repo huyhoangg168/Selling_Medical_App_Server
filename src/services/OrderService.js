@@ -5,6 +5,7 @@ const createZaloPayRequest = require('../Payment/ZaloPay/CreateZalopayRequest');
 const asyncErrorWrapper = require('../Utils/AsyncErrorWrapper');
 const { customAlphabet } = require('nanoid');
 const { Op, literal } = require('sequelize');
+const sequelize = require('../config/database');
 const CustomError = require('../Utils/CustomError');
 const { el } = require('date-fns/locale');
 
@@ -106,25 +107,26 @@ async function getOrderByCode(code) {
 exports.getOrderByCode = asyncErrorWrapper(getOrderByCode);
 
 exports.createOrderWithCOD = asyncErrorWrapper(async (listCartItem, order) => {
+    return await sequelize.transaction(async (t) => {
+        order.code = generateOrderCode();
+        order.status = 2; //pending
 
-    order.code = generateOrderCode();
-    order.status = 2; //pending
-    const newOrder = await Order.create(order);
+        const newOrder = await Order.create(order, { transaction: t });
 
-    if (newOrder) {
-        await handleOrderCompletion(listCartItem, newOrder);
-    }
+        if (newOrder) {
+            await handleOrderCompletion(listCartItem, newOrder, t);
+        }
 
-    //order success => send notification
-    // await sendUserNotification(     
-    //     {
-    //         id_user: order.userId,
-    //         title: 'Đặt hàng thành công!', 
-    //         content: `Cảm ơn sự ủng hộ của bạn! Đơn hàng với ${listCartItem.length} sản phẩm đang trên đường đến bạn.`
-    //     }
-    // );
-
-    return newOrder;
+        //order success => send notification
+        // await sendUserNotification(
+        //     {
+        //         id_user: order.userId,
+        //         title: 'Đặt hàng thành công!',
+        //         content: `Cảm ơn sự ủng hộ của bạn! Đơn hàng với ${listCartItem.length} sản phẩm đang trên đường đến bạn.`
+        //     }
+        // );
+        return newOrder;
+    });
 });
 
 
@@ -140,17 +142,21 @@ exports.createOrderWithMoMo = asyncErrorWrapper(async (listCartItem, order) => {
         const error = new CustomError('Bad Gateway: The server received an invalid response from the upstream server', 502)
         throw error;
     }
-    // 2. Tạo đơn hàng mới
-    order.code = orderCode;
-    order.status = 2; //pending 
-    const newOrder = await Order.create(order);
 
-    if (newOrder) {
-        await handleOrderCompletion(listCartItem, newOrder);  //Process data related to orders : cart, point, coupon, ...
-    }
-    console.log(result)
-    return result;
+    // 2. Tạo đơn hàng mới + trừ kho trong 1 transaction (chống oversell)
+    return await sequelize.transaction(async (t) => {
+        order.code = orderCode;
+        order.status = 2; //pending
+        const newOrder = await Order.create(order, { transaction: t });
+
+        if (newOrder) {
+            await handleOrderCompletion(listCartItem, newOrder, t);
+        }
+        console.log(result)
+        return result;
+    });
 });
+
 
 exports.saveMoMoOrderInfo = asyncErrorWrapper(async (orderInfo) => {
     const momoOrderInfo = await MoMoOrderInfo.create(orderInfo);
@@ -158,7 +164,7 @@ exports.saveMoMoOrderInfo = asyncErrorWrapper(async (orderInfo) => {
 });
 
 
-const handleOrderCompletion = asyncErrorWrapper(async (listCartItem, order) => {
+const handleOrderCompletion = asyncErrorWrapper(async (listCartItem, order, transaction) => {
     // 1.Thêm các mặt hàng vào chi tiết đơn hàng
     const listOrderItem = listCartItem.map(item => ({
         id_order: order.id,
@@ -168,20 +174,32 @@ const handleOrderCompletion = asyncErrorWrapper(async (listCartItem, order) => {
         quantity: item.quantity
     }));
 
-    await OrderDetail.bulkCreate(listOrderItem);
+    await OrderDetail.bulkCreate(listOrderItem, { transaction });
 
-    // 2.Cập nhật số lượng sản phẩm trong kho
-    await Promise.all(listOrderItem.map(item =>
+    // 2.Cập nhật số lượng sản phẩm trong kho (atomic + chống oversell)
+    const updateResults = await Promise.all(listOrderItem.map(item =>
         Product.update(
-            { quantity: literal(`quantity - ${item.quantity}`) }, // Sử dụng literal để tính toán số lượng mới
-            { where: { id: item.id_product } }
+            { quantity: literal(`quantity - ${item.quantity}`) },
+            {
+                where: {
+                    id: item.id_product,
+                    quantity: { [Op.gte]: item.quantity } // chỉ trừ kho nếu còn đủ
+                },
+                transaction
+            }
         )
     ));
 
+    // Nếu có sản phẩm không đủ tồn (affectedRows = 0) => rollback toàn bộ
+    const isOutOfStock = updateResults.some(([affectedRows]) => affectedRows === 0);
+    if (isOutOfStock) {
+        throw new CustomError('Thanh toán không thành công: sản phẩm đã hết hàng hoặc không đủ số lượng.', 409);
+    }
+
     // 3. Cộng điểm thưởng cho người dùng
-    const user = await User.findByPk(order.userId);
+    const user = await User.findByPk(order.userId, { transaction });
     user.point += order.point;
-    await user.save();
+    await user.save({ transaction });
 
     // 4. Xóa mục giỏ hàng
     const productIds = listCartItem.map(item => item.product.id);
@@ -189,12 +207,13 @@ const handleOrderCompletion = asyncErrorWrapper(async (listCartItem, order) => {
         where: {
             id_product: { [Op.in]: productIds },
             id_user: user.id
-        }
+        },
+        transaction
     });
 
     // 5. Cập nhật mã khuyến mãi đã sử dụng (update status)
     if (order.redeemedCouponId !== 0) {
-        const redeemedCoupon = await RedeemedCoupon.findByPk(order.redeemedCouponId);
+        const redeemedCoupon = await RedeemedCoupon.findByPk(order.redeemedCouponId, { transaction });
         if (!redeemedCoupon) {
             const error = new CustomError('The redeemed has been used!', 400);
             throw error;
@@ -205,9 +224,8 @@ const handleOrderCompletion = asyncErrorWrapper(async (listCartItem, order) => {
             throw error;
         }
         redeemedCoupon.status = 0;
-        await redeemedCoupon.save();
+        await redeemedCoupon.save({ transaction });
     }
-
 });
 
 
