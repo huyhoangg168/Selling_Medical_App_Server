@@ -3,3 +3,5 @@ node_modules/
 .env
 
 firebase-adminsdk.json
+
+android-key.json

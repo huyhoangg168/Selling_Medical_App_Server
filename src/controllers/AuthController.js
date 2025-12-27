@@ -43,12 +43,16 @@ exports.signup = asyncErrorHandler(async (req, res, next) => {
 
 exports.login = asyncErrorHandler(async (req, res, next) => {
 
-    const {phone, password} = req.body;
+    // Lấy thêm captchaToken từ client gửi lên
+    const { phone, password, captchaToken } = req.body;
+    
+    // Lấy IP của user
+    const ipAddr = req.ip;
 
-    const user = await authService.login(phone, password, next);
+    // Truyền vào service
+    const user = await authService.login(phone, password, captchaToken, ipAddr);
     
     createSendRespone(user, 200, res);  
-    
 });
 
 
