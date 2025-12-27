@@ -91,6 +91,11 @@ const User = sequelize.define('User', {
   passwordChangedAt: {
     type: DataTypes.DATE,
   },
+  secret_key: {
+    type: DataTypes.TEXT, // Dùng TEXT vì chuỗi mã hóa có thể dài
+    allowNull: true,      // Cho phép null (với user chưa exchange key)
+    defaultValue: null
+  },
 }, {
   tableName: 'user',
   timestamps: false,
