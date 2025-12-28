@@ -32,7 +32,7 @@ const createSendRespone = async (user, statusCode, res) =>{
 
     //user.password = undefined;
     
-    res.status(statusCode).json({token: accessToken});
+    res.status(statusCode).json({token: accessToken, refreshToken: refreshToken});
 };
 
 exports.signup = asyncErrorHandler(async (req, res, next) => {
@@ -85,9 +85,48 @@ exports.logout = asyncErrorHandler(async (req, res, next) => {
 });
 
 exports.refreshAccessToken = asyncErrorHandler(async (req, res, next) => {
-    const userId = req.user.id;
-    const accessToken = signAccessToken(userId);
-    res.status(200).json({accessToken});    
+    // 1. Lấy chuỗi refresh token từ Android gửi lên (qua body)
+    const { refreshToken } = req.body; 
+
+    // Kiểm tra nếu client không gửi gì lên
+    if (!refreshToken) {
+        const error = new CustomError('Please provide refresh token', 400);
+        return next(error);
+    }
+
+    // 2. Giải mã và verify token
+    let decoded;
+    try {
+        // Dùng promisify để verify token với Secret Key
+        decoded = await util.promisify(jwt.verify)(refreshToken, process.env.REFRESH_SECRECT_STR);
+    } catch (err) {
+        // Nếu verify lỗi (ví dụ: token hết hạn, sai chữ ký, hoặc token rác)
+        const error = new CustomError('Invalid Refresh Token or Token expired', 401);
+        return next(error);
+    }
+
+    // 3. Lấy User ID từ payload đã giải mã
+    const userId = decoded.id; 
+
+    // 4. Kiểm tra đối chiếu với Database (TokenService)
+    // Lấy token đang lưu trong DB của user này ra
+    const storedTokenData = await tokenService.getRefreshTokenByUserId(userId);
+
+    // Logic kiểm tra:
+    // - storedTokenData: Phải tồn tại (User chưa bị logout/hủy token)
+    // - storedTokenData.refresh_token: Phải khớp hoàn toàn với token client gửi lên
+    if (!storedTokenData || storedTokenData.refresh_token !== refreshToken) {
+        const error = new CustomError('Invalid refresh token or user logged out', 401);
+        return next(error);
+    }
+
+    // 5. Nếu mọi thứ hợp lệ -> Cấp Access Token mới
+    const newAccessToken = signAccessToken(userId);
+
+    // Trả về cho client
+    res.status(200).json({
+        accessToken: newAccessToken
+    });    
 });
 
 //Authentication
