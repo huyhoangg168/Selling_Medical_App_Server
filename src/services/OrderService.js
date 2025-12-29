@@ -77,17 +77,35 @@ exports.getAllOrdersForAdmin = asyncErrorWrapper(async (status) => {
 
         // Lấy key giải mã của User này
         const userKey = order.user ? await getUserKey(order.user.id) : null;
+        const WARNING_MSG = "⚠️ TAMPERED";
 
         if (userKey) {
-    // Giải mã Địa chỉ
-    if (order.userAddress && order.userAddress.startsWith("AES_ENCRYPTED:")) {
-        order.userAddress = decryptData(order.userAddress, userKey);
-    }
-    
-    // Giải mã Ghi chú
-    if (order.note && order.note.startsWith("AES_ENCRYPTED:")) {
-        order.note = decryptData(order.note, userKey);
-    }
+    // 1. Kiểm tra Địa chỉ
+        if (order.userAddress) {
+            if (order.userAddress.startsWith("AES_ENCRYPTED:")) {
+                try {
+                    order.userAddress = decryptData(order.userAddress, userKey);
+                } catch (e) {
+                    order.userAddress = "⛔ LỖI GIẢI MÃ (Khóa sai hoặc dữ liệu hỏng)";
+                }
+            } else {
+                // Nếu dữ liệu không bắt đầu bằng AES_ENCRYPTED -> Đánh dấu bị can thiệp
+                order.userAddress = WARNING_MSG;
+            }
+        }
+        
+        // 2. Kiểm tra Ghi chú (Tương tự)
+        if (order.note) {
+            if (order.note.startsWith("AES_ENCRYPTED:")) {
+                 try {
+                    order.note = decryptData(order.note, userKey);
+                } catch (e) {
+                    order.note = "⛔ LỖI GIẢI MÃ";
+                }
+            } else {
+                order.note = WARNING_MSG;
+            }
+        }
 
     // === BỎ COMMENT ĐOẠN NÀY NẾU MUỐN BACKEND GIẢI MÃ SĐT LUÔN ===
     // (Nếu DB lưu phone dạng plaintext thì không cần, nhưng nếu lưu mã hóa thì phải mở ra)

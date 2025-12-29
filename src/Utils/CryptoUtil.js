@@ -40,7 +40,7 @@ const decryptData = (encryptedString, base64Key) => {
     } catch (error) {
         // Đây là chỗ bắt được hacker modify
         console.error("CẢNH BÁO: Phát hiện dữ liệu bị can thiệp (Integrity Check Failed)!");
-        return "⛔ DỮ LIỆU ĐÃ BỊ THAY ĐỔI TRÁI PHÉP";
+        return "⚠️ TAMPERED";
     }
 };
 
