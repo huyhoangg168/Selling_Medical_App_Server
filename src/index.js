@@ -4,6 +4,7 @@ const morgan = require('morgan');
 const bodyParser = require('body-parser');
 const globalErrorHandler = require('../src/controllers/ErrorController');
 const route = require('./routes');
+const rateLimit = require('express-rate-limit');
 
 const sync = require('./scripts/sync')
 
@@ -37,3 +38,18 @@ sync();
 app.listen(port, () => {
   console.log(`app is running on  port ${port}`)
 })
+
+// Layer 1: Global Rate Limit - Giới hạn 100 request/15 phút mỗi IP
+const globalLimiter = rateLimit({
+	windowMs: 15 * 60 * 1000, // 15 phút
+	max: 100, // Limit each IP to 100 requests per `window`
+	standardHeaders: true, 
+	legacyHeaders: false, 
+    message: {
+        status: 429,
+        message: "Quá nhiều yêu cầu từ IP này, vui lòng thử lại sau 15 phút"
+    }
+});
+
+// Apply cho tất cả routes
+app.use(globalLimiter);
