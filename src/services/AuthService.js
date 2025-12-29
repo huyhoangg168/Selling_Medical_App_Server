@@ -5,14 +5,103 @@ const bcrypt = require('bcryptjs');
 const asyncErrorWrapper = require('../Utils/AsyncErrorWrapper');
 const CustomError = require('../Utils/CustomError');
 const userService = require('../services/UserService');
+const axios = require('axios');
 
 const { OAuth2Client } = require('google-auth-library');
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const client = new OAuth2Client(GOOGLE_CLIENT_ID);
+const redisClient = require('../config/redisClient');
+const { RateLimiterRedis } = require('rate-limiter-flexible');
+
+const { RecaptchaEnterpriseServiceClient } = require('@google-cloud/recaptcha-enterprise');
+const path = require('path');
+
+// Đường dẫn đến file JSON bạn vừa tải về
+const keyPath = path.join(__dirname, '../../android-key.json'); 
+
+const client2 = new RecaptchaEnterpriseServiceClient({
+    keyFilename: keyPath
+});
 
 // const twilio = require('twilio');
 // const twilio_client = require('twilio')(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 // const otpGenerator = require('otp-generator');
+
+// CẤU HÌNH RATE LIMITER TRONG REDIS
+// 1. Limiter đếm số lần sai (để yêu cầu Captcha)
+const maxWrongAttemptsByIPperDay = 100;
+const limiterSlowBruteByIP = new RateLimiterRedis({
+    storeClient: redisClient,
+    keyPrefix: 'login_fail_ip_per_day',
+    points: maxWrongAttemptsByIPperDay,
+    duration: 60 * 60 * 24,
+    blockDuration: 60 * 60 * 24, // Block 1 ngày nếu spam quá kinh khủng
+});
+
+// 2. Limiter đếm số lần sai của SĐT (để khóa tài khoản)
+const maxConsecutiveFailsByPhone = 5;
+const limiterConsecutiveFailsByPhone = new RateLimiterRedis({
+    storeClient: redisClient,
+    keyPrefix: 'login_fail_consecutive_phone',
+    points: maxConsecutiveFailsByPhone,
+    duration: 60 * 60 * 24, // Lưu lâu dài cho đến khi login đúng
+    blockDuration: 60 * 30, // Khóa 30 phút nếu sai quá 5 lần
+});
+
+// Hàm phụ trợ: Xác thực Captcha với Google
+async function verifyCaptcha(captchaToken) {
+    if (!captchaToken) return false;
+    try {
+        const secretKey = process.env.RECAPTCHA_SECRET_KEY; // Cấu hình trong .env
+        const verifyUrl = `https://www.google.com/recaptcha/api/siteverify?secret=${secretKey}&response=${captchaToken}`;
+        const response = await axios.post(verifyUrl);
+        return response.data.success;
+    } catch (error) {
+        console.error("Captcha verify error:", error);
+        return false;
+    }
+}
+
+async function verifyCaptchaEnterprise(token) {
+    const projectID = "boxwood-valve-482512-u9"; // ID Project 
+    const recaptchaKey = "6LeEYDgsAAAAANgtg14NwAM7LsnbYNdCIg1GMdMH"; // Site Key Enterprise
+    const projectPath = client2.projectPath(projectID);
+
+    const request = {
+        parent: projectPath,
+        assessment: {
+            event: {
+                token: token,
+                siteKey: recaptchaKey,
+            },
+        },
+    };
+
+    try {
+        const [response] = await client2.createAssessment(request);
+
+        // Kiểm tra token có hợp lệ không
+        if (!response.tokenProperties.valid) {
+            console.log("Token invalid:", response.tokenProperties.invalidReason);
+            return false;
+        }
+
+        // Kiểm tra Action có khớp không (Ở Android mình đặt là LOGIN)
+        if (response.tokenProperties.action !== "LOGIN") {
+            console.log("Sai Action");
+            return false;
+        }
+
+        // Kiểm tra điểm số (Score) - Enterprise trả về điểm từ 0.0 đến 1.0
+        // Bạn có thể chặn nếu điểm thấp (ví dụ < 0.5 là bot)
+        console.log("Score:", response.riskAnalysis.score);
+        return response.riskAnalysis.score > 0.5;
+
+    } catch (e) {
+        console.error("Lỗi verify Enterprise:", e);
+        return false;
+    }
+}
 
 
 async function verifyGoogleIdToken(idToken) {
@@ -115,23 +204,79 @@ exports.signup = asyncErrorWrapper(async (userData) => {
     return user;
 });
 
-exports.login = asyncErrorWrapper(async (phoneNumber, password, next) => {
+exports.login = asyncErrorWrapper(async (phoneNumber, password, captchaToken, ipAddr) => {
     if (!phoneNumber || !password) {
-        const error = new CustomError('Please provide phone number and password for login!', 400);
-        throw error;
+        throw new CustomError('Vui lòng cung cấp số điện thoại và mật khẩu!', 400);
     }
+
+    const phoneKey = phoneNumber; 
+
+    const resIp = await limiterSlowBruteByIP.get(ipAddr);
+    if (resIp !== null && resIp.consumedPoints > maxWrongAttemptsByIPperDay) {
+        throw new CustomError('IP của bạn bị chặn 1 ngày do nghi ngờ spam!', 429);
+    }
+    
+    // --- BƯỚC 1: KIỂM TRA CÓ BỊ KHÓA KHÔNG (Layer 3) ---
+    const resPhone = await limiterConsecutiveFailsByPhone.get(phoneKey);
+    
+    // Nếu điểm sai > số lần cho phép và thời gian khóa chưa hết
+    if (resPhone !== null && resPhone.consumedPoints >= maxConsecutiveFailsByPhone) {
+        const retrySecs = Math.round(resPhone.msBeforeNext / 1000) || 1;
+        throw new CustomError(`Tài khoản tạm khóa do nhập sai quá nhiều. Thử lại sau ${retrySecs} giây`, 429);
+    }
+
+    // --- BƯỚC 2: KIỂM TRA CÓ CẦN CAPTCHA KHÔNG (Layer 4) ---
+    // Logic: Nếu đã sai > 3 lần thì bắt buộc phải có Captcha
+    if (resPhone !== null && resPhone.consumedPoints >= 3) {
+        if (!captchaToken) {
+            throw new CustomError('Hệ thống phát hiện bất thường. Vui lòng xác thực CAPTCHA!', 403); // Mã lỗi riêng để Client hiện Captcha
+        }
+        const isCaptchaValid = await verifyCaptchaEnterprise(captchaToken);
+        if (!isCaptchaValid) {
+            throw new CustomError('Xác thực CAPTCHA thất bại!', 400);
+        }
+    }
+
+    // --- BƯỚC 3: KIỂM TRA USER & PASS ---
     const user = await User.scope('withPassword').findOne({ where: { phone: phoneNumber } });
 
+    // Hàm xử lý khi đăng nhập thất bại
+    const handleLoginFail = async () => {
+        try {
+            // Tăng biến đếm sai cho SĐT
+            await limiterConsecutiveFailsByPhone.consume(phoneKey); 
+
+            // --- TĂNG BIẾN ĐẾM SAI CHO IP ---
+            await limiterSlowBruteByIP.consume(ipAddr);
+        } catch (rlRejected) {
+            // Nếu nhảy vào đây nghĩa là đã vượt quá giới hạn (bị Block)
+            throw new CustomError('Bạn đã nhập sai quá nhiều lần. Tài khoản bị khóa 30 phút!', 429);
+        }
+    };
+
     if (!user) {
-        const error = new CustomError(`The user login with phone number: ${phoneNumber} does not exits`, 401)
-        throw error;
+        await handleLoginFail();
+        throw new CustomError(`Thông tin đăng nhập không chính xác`, 401);
     }
 
     const isMatch = await user.comparePassword(password);
     if (!isMatch) {
-        const error = new CustomError('Incorrect password!', 400);
-        throw error;
+        await handleLoginFail();
+        
+        // Lấy số lần đã sai để báo cho user
+        const currentFail = await limiterConsecutiveFailsByPhone.get(phoneKey);
+        const failCount = currentFail ? currentFail.consumedPoints : 1;
+        const left = maxConsecutiveFailsByPhone - failCount;
+        
+        if (left <= 0) {
+             throw new CustomError('Bạn đã nhập sai quá nhiều lần. Tài khoản bị khóa 30 phút!', 429);
+        }
+
+        throw new CustomError(`Mật khẩu không đúng! Bạn còn ${left} lần thử.`, 401);
     }
+
+    // --- BƯỚC 4: ĐĂNG NHẬP THÀNH CÔNG -> RESET COUNTER ---
+    await limiterConsecutiveFailsByPhone.delete(phoneKey); // Xóa bộ đếm sai
 
     return user;
 });

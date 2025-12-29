@@ -8,10 +8,23 @@ const { Op, literal } = require('sequelize');
 const sequelize = require('../config/database');
 const CustomError = require('../Utils/CustomError');
 const { el } = require('date-fns/locale');
+const { decryptWithMasterKey } = require('../controllers/KeyController'); 
+const { decryptData } = require('../Utils/CryptoUtil');
 
 const notificateService = require('../services/NotificateService');
 
-
+const getUserKey = async (userId) => {
+    const user = await User.findByPk(userId);
+    if (!user || !user.secret_key) return null;
+    
+    try {
+        // Giải mã bằng Master Key để lấy AES Key gốc
+        return decryptWithMasterKey(user.secret_key);
+    } catch (e) {
+        console.error("Lỗi giải mã User Key bằng Master Key", e);
+        return null;
+    }
+};
 
 exports.getAllOrdersByUserId = asyncErrorWrapper(async (userId) => {
     const orders = await Order.findAll({
@@ -40,13 +53,14 @@ exports.getAllOrdersForAdmin = asyncErrorWrapper(async (status) => {
         whereClause.status = status;
     }
 
+    // 1. Lấy dữ liệu thô (đang bị mã hóa) từ DB
     const orders = await Order.findAll({
         where: whereClause,
         include: [
             {
                 model: User,
                 as: 'user',
-                attributes: ['phone', 'email', 'username']
+                attributes: ['id', 'phone', 'email', 'username'] 
             },
             {
                 model: RedeemedCoupon,
@@ -54,11 +68,40 @@ exports.getAllOrdersForAdmin = asyncErrorWrapper(async (status) => {
                 attributes: ['code']
             }
         ],
-        attributes: { exclude: ['id_user', 'id_redeemed_coupon'] },
         order: [['orderTime', 'DESC']]
     });
 
-    return orders;
+    // 2. Duyệt qua từng đơn hàng và GIẢI MÃ (Decrypt)
+    const decryptedOrders = await Promise.all(orders.map(async (orderInstance) => {
+        const order = orderInstance.get({ plain: true }); // Chuyển sang JSON object thường
+
+        // Lấy key giải mã của User này
+        const userKey = order.user ? await getUserKey(order.user.id) : null;
+
+        if (userKey) {
+    // Giải mã Địa chỉ
+    if (order.userAddress && order.userAddress.startsWith("AES_ENCRYPTED:")) {
+        order.userAddress = decryptData(order.userAddress, userKey);
+    }
+    
+    // Giải mã Ghi chú
+    if (order.note && order.note.startsWith("AES_ENCRYPTED:")) {
+        order.note = decryptData(order.note, userKey);
+    }
+
+    // === BỎ COMMENT ĐOẠN NÀY NẾU MUỐN BACKEND GIẢI MÃ SĐT LUÔN ===
+    // (Nếu DB lưu phone dạng plaintext thì không cần, nhưng nếu lưu mã hóa thì phải mở ra)
+    if (order.user && order.user.phone && order.user.phone.startsWith("AES_ENCRYPTED:")) {
+       order.user.phone = decryptData(order.user.phone, userKey);
+    }
+    // ==============================================================
+}
+
+        return order;
+    }));
+
+    // 3. Trả về dữ liệu sạch (Plaintext) cho Admin App
+    return decryptedOrders;
 });
 
 // Thống kê đơn hàng cho admin
