@@ -26,7 +26,7 @@ const client2 = new RecaptchaEnterpriseServiceClient({
 // const twilio = require('twilio');
 // const twilio_client = require('twilio')(process.env.TWILIO_SID, process.env.TWILIO_AUTH_TOKEN);
 // const otpGenerator = require('otp-generator');
-
+const wait = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 // CẤU HÌNH RATE LIMITER TRONG REDIS
 // 1. Limiter đếm số lần sai (để yêu cầu Captcha)
 const maxWrongAttemptsByIPperDay = 100;
@@ -34,8 +34,8 @@ const limiterSlowBruteByIP = new RateLimiterRedis({
     storeClient: redisClient,
     keyPrefix: 'login_fail_ip_per_day',
     points: maxWrongAttemptsByIPperDay,
-    duration: 60 * 60 * 24,
-    blockDuration: 60 * 60 * 24, // Block 1 ngày nếu spam quá kinh khủng
+    duration: 60 * 60,
+    blockDuration: 60 * 30, // Block 30p
 });
 
 // 2. Limiter đếm số lần sai của SĐT (để khóa tài khoản)
@@ -44,7 +44,7 @@ const limiterConsecutiveFailsByPhone = new RateLimiterRedis({
     storeClient: redisClient,
     keyPrefix: 'login_fail_consecutive_phone',
     points: maxConsecutiveFailsByPhone,
-    duration: 60 * 60 * 24, // Lưu lâu dài cho đến khi login đúng
+    duration: 60 * 60, // Lưu lâu dài cho đến khi login đúng
     blockDuration: 60 * 30, // Khóa 30 phút nếu sai quá 5 lần
 });
 
@@ -52,7 +52,7 @@ const limiterConsecutiveFailsByPhone = new RateLimiterRedis({
 async function verifyCaptcha(captchaToken) {
     if (!captchaToken) return false;
     try {
-        const secretKey = process.env.RECAPTCHA_SECRET_KEY; // Cấu hình trong .env
+        const secretKey = process.env.RECAPTCHA_SECRET_KEY;
         const verifyUrl = `https://www.google.com/recaptcha/api/siteverify?secret=${secretKey}&response=${captchaToken}`;
         const response = await axios.post(verifyUrl);
         return response.data.success;
@@ -64,7 +64,7 @@ async function verifyCaptcha(captchaToken) {
 
 async function verifyCaptchaEnterprise(token) {
     const projectID = "boxwood-valve-482512-u9"; // ID Project 
-    const recaptchaKey = "6LeEYDgsAAAAANgtg14NwAM7LsnbYNdCIg1GMdMH"; // Site Key Enterprise
+    const recaptchaKey = process.env.RECAPTCHA_KEY; // Site Key Enterprise
     const projectPath = client2.projectPath(projectID);
 
     const request = {
@@ -211,43 +211,58 @@ exports.login = asyncErrorWrapper(async (phoneNumber, password, captchaToken, ip
 
     const phoneKey = phoneNumber; 
 
+    // 1. CHECK IP (Layer 1)
     const resIp = await limiterSlowBruteByIP.get(ipAddr);
-    if (resIp !== null && resIp.consumedPoints > maxWrongAttemptsByIPperDay) {
-        throw new CustomError('IP của bạn bị chặn 1 ngày do nghi ngờ spam!', 429);
+    if (resIp !== null && resIp.consumedPoints >= maxWrongAttemptsByIPperDay) {
+        // Lấy thời gian retry chuẩn từ block duration
+        const retrySecs = Math.round(resIp.msBeforeNext / 1000) || 60;
+        throw new CustomError(`IP bị khóa tạm thời. Thử lại sau ${retrySecs} giây`, 429);
     }
     
-    // --- BƯỚC 1: KIỂM TRA CÓ BỊ KHÓA KHÔNG (Layer 3) ---
+    // 2. CHECK PHONE (Layer 2)
     const resPhone = await limiterConsecutiveFailsByPhone.get(phoneKey);
     
-    // Nếu điểm sai > số lần cho phép và thời gian khóa chưa hết
+    // Nếu đã bị khóa (Block)
     if (resPhone !== null && resPhone.consumedPoints >= maxConsecutiveFailsByPhone) {
-        const retrySecs = Math.round(resPhone.msBeforeNext / 1000) || 1;
+        const retrySecs = Math.round(resPhone.msBeforeNext / 1000) || 60;
         throw new CustomError(`Tài khoản tạm khóa do nhập sai quá nhiều. Thử lại sau ${retrySecs} giây`, 429);
     }
 
-    // --- BƯỚC 2: KIỂM TRA CÓ CẦN CAPTCHA KHÔNG (Layer 4) ---
-    // Logic: Nếu đã sai > 3 lần thì bắt buộc phải có Captcha
+    // 3. YÊU CẦU CAPTCHA (Layer 3 - Chưa khóa, nhưng nghi ngờ)
+    // Nếu đã sai >= 3 lần (tức là lần thử thứ 4 trở đi)
     if (resPhone !== null && resPhone.consumedPoints >= 3) {
         if (!captchaToken) {
-            throw new CustomError('Hệ thống phát hiện bất thường. Vui lòng xác thực CAPTCHA!', 403); // Mã lỗi riêng để Client hiện Captcha
+            // Trả về 403 để Client bật Captcha lên
+            throw new CustomError('Hệ thống phát hiện bất thường. Vui lòng xác thực CAPTCHA!', 403); 
         }
         const isCaptchaValid = await verifyCaptchaEnterprise(captchaToken);
         if (!isCaptchaValid) {
-            throw new CustomError('Xác thực CAPTCHA thất bại!', 400);
+            throw new CustomError('Xác thực CAPTCHA thất bại/Điểm tín nhiệm thấp!', 400);
         }
     }
 
-    // --- BƯỚC 3: KIỂM TRA USER & PASS ---
+    // 4. CHECK DB (Layer 4)
     const user = await User.scope('withPassword').findOne({ where: { phone: phoneNumber } });
 
     // Hàm xử lý khi đăng nhập thất bại
     const handleLoginFail = async () => {
         try {
-            // Tăng biến đếm sai cho SĐT
-            await limiterConsecutiveFailsByPhone.consume(phoneKey); 
+            // Dùng Promise.all để đảm bảo cả 2 đều được cộng điểm phạt
+            const [resPhoneFail, resIpFail] = await Promise.all([
+                limiterConsecutiveFailsByPhone.consume(phoneKey),
+                limiterSlowBruteByIP.consume(ipAddr)
+            ]);
+            
+            // Logic Delay (Tarpit)
+            const failCount = resPhoneFail.consumedPoints;
+            let delayTime = 0;
+            if (failCount === 3) delayTime = 1000; 
+            if (failCount === 4) delayTime = 2000; 
+            if (failCount === 5) delayTime = 4000; 
 
-            // --- TĂNG BIẾN ĐẾM SAI CHO IP ---
-            await limiterSlowBruteByIP.consume(ipAddr);
+            if (delayTime > 0) {
+                await wait(delayTime);
+            }
         } catch (rlRejected) {
             // Nếu nhảy vào đây nghĩa là đã vượt quá giới hạn (bị Block)
             throw new CustomError('Bạn đã nhập sai quá nhiều lần. Tài khoản bị khóa 30 phút!', 429);
@@ -275,8 +290,11 @@ exports.login = asyncErrorWrapper(async (phoneNumber, password, captchaToken, ip
         throw new CustomError(`Mật khẩu không đúng! Bạn còn ${left} lần thử.`, 401);
     }
 
-    // --- BƯỚC 4: ĐĂNG NHẬP THÀNH CÔNG -> RESET COUNTER ---
-    await limiterConsecutiveFailsByPhone.delete(phoneKey); // Xóa bộ đếm sai
+    // --- 5. SUCCESS -> RESET TOÀN BỘ ---
+    await Promise.all([
+        limiterConsecutiveFailsByPhone.delete(phoneKey),
+        limiterSlowBruteByIP.delete(ipAddr)
+    ]);
 
     return user;
 });
